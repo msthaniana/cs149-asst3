@@ -14,6 +14,23 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -32,7 +49,8 @@ struct GlobalConstants {
     int imageHeight;
     float* imageData;
 
-    float* pixelList;
+    uint8_t* pixelList;
+    float* circleColor;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -363,14 +381,17 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int 
         alpha = .5f;
     }
 
-    // Store results in global pixelList array
-    int pixelListIndex = (pixelY * cuConstRendererParams.imageWidth + pixelX) * 4 * cuConstRendererParams.numCircles;
+    // store color data into circleColor array for each circle
     float4 result_rgb = make_float4(rgb.x, rgb.y, rgb.z, alpha);
+    int circleColorIndex = 4 * circleIndex;
+    float4* circleColorPtr = (float4*)(&cuConstRendererParams.circleColor[circleColorIndex]);
+    *circleColorPtr = result_rgb;
 
-    float4* pixelListPtr = (float4*)(&cuConstRendererParams.pixelList[pixelListIndex]);
-    pixelListPtr += circleIndex;
-    *pixelListPtr = result_rgb;
+    // Store whether the circle exists on this pixel in pixelList
+    int pixelListIndex = (pixelY * cuConstRendererParams.imageWidth + pixelX) * cuConstRendererParams.numCircles + circleIndex;
 
+    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[pixelListIndex]);
+    *pixelListPtr = 1;
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -442,18 +463,20 @@ __global__ void kernelRenderPixels() {
     float4 rgb_circle;
     float oneMinusAlpha, alpha;
     // Find starting point within large pixelList array
-    int pixelListIndex = index * cuConstRendererParams.numCircles * 4; 
+    int pixelListIndex = index * cuConstRendererParams.numCircles;
 
     // Iterate over each circle result to determine final pixel
     for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
-        rgb_circle = *(float4*)(&cuConstRendererParams.pixelList[pixelListIndex+circleIndex*4]);
-        alpha = rgb_circle.w;
-        oneMinusAlpha = 1.f - alpha;
+        if (cuConstRendererParams.pixelList[pixelListIndex + circleIndex] == 1){ //this would indicate that the circle is present at this pixel
+            rgb_circle = *(float4*)(&cuConstRendererParams.circleColor[circleIndex*4]);
+            alpha = rgb_circle.w;
+            oneMinusAlpha = 1.f - alpha;
 
-        existingColor.x = alpha * rgb_circle.x + oneMinusAlpha * existingColor.x;
-        existingColor.y = alpha * rgb_circle.y + oneMinusAlpha * existingColor.y;
-        existingColor.z = alpha * rgb_circle.z + oneMinusAlpha * existingColor.z;
-        existingColor.w += alpha;
+            existingColor.x = alpha * rgb_circle.x + oneMinusAlpha * existingColor.x;
+            existingColor.y = alpha * rgb_circle.y + oneMinusAlpha * existingColor.y;
+            existingColor.z = alpha * rgb_circle.z + oneMinusAlpha * existingColor.z;
+            existingColor.w += alpha;
+        }
     }
 
     // Write result back to memory
@@ -478,6 +501,7 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
     cudaDevicePixelList = NULL;
+    cudaDeviceCircleColor = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -499,7 +523,8 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
-        cudaFree(cudaDevicePixelList);
+        cudaCheckError(cudaFree(cudaDevicePixelList));
+        cudaCheckError(cudaFree(cudaDeviceCircleColor));
     }
 }
 
@@ -560,7 +585,8 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
-    cudaMalloc(&cudaDevicePixelList, sizeof(float) * 4 * image->width * image->height * numCircles);
+    cudaCheckError(cudaMalloc(&cudaDevicePixelList,sizeof(uint8_t) * image->width * image->height * numCircles));//holds info about whether the corresponding circle exists at that pixel //TODO: need to make this further smaller
+    cudaCheckError(cudaMalloc(&cudaDeviceCircleColor, sizeof(float) * 4 * numCircles));//holds the color info for each circle
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -585,7 +611,8 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
-    params.pixelList = cudaDevicePixelList; 
+    params.pixelList = cudaDevicePixelList;
+    params.circleColor = cudaDeviceCircleColor;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -669,22 +696,6 @@ CudaRenderer::advanceAnimation() {
     }
     cudaDeviceSynchronize();
 }
-
-#define DEBUG
-#ifdef DEBUG
-#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
-inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
-        cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-#else
-#define cudaCheckError(ans) ans
-#endif
 
 void
 CudaRenderer::render() {
