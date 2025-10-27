@@ -31,6 +31,8 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+    float* pixelList;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -318,7 +320,7 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int pixelX, int pixelY) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -361,22 +363,14 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         alpha = .5f;
     }
 
-    float oneMinusAlpha = 1.f - alpha;
+    // Store results in global pixelList array
+    int pixelListIndex = (pixelY * cuConstRendererParams.imageWidth + pixelX) * 4 * cuConstRendererParams.numCircles;
+    float4 result_rgb = make_float4(rgb.x, rgb.y, rgb.z, alpha);
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
+    float4* pixelListPtr = (float4*)(&cuConstRendererParams.pixelList[pixelListIndex]);
+    pixelListPtr += circleIndex;
+    *pixelListPtr = result_rgb;
 
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
-
-    // global memory write
-    *imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -390,6 +384,7 @@ __global__ void kernelRenderCircles() {
 
     if (index >= cuConstRendererParams.numCircles)
         return;
+    //printf("Running renderCircles for circle=%d, numCircles=%d\n", index, cuConstRendererParams.numCircles);
 
     int index3 = 3 * index;
 
@@ -421,10 +416,48 @@ __global__ void kernelRenderCircles() {
         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
+            shadePixel(index, pixelCenterNorm, p, imgPtr, pixelX, pixelY);
             imgPtr++;
         }
     }
+}
+
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread renders a pixel by iterating through the list of circle
+// results and accumulating its effect on this pixel in the correct
+// order of operations.
+__global__ void kernelRenderPixels() {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= cuConstRendererParams.imageHeight * cuConstRendererParams.imageWidth)
+        return;
+
+    // Determine imagePtr to update
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * index]);
+
+    // Read initial pixel value
+    float4 existingColor = *imgPtr;
+
+    float4 rgb_circle;
+    float oneMinusAlpha, alpha;
+    // Find starting point within large pixelList array
+    int pixelListIndex = index * cuConstRendererParams.numCircles * 4; 
+
+    // Iterate over each circle result to determine final pixel
+    for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
+        rgb_circle = *(float4*)(&cuConstRendererParams.pixelList[pixelListIndex+circleIndex*4]);
+        alpha = rgb_circle.w;
+        oneMinusAlpha = 1.f - alpha;
+
+        existingColor.x = alpha * rgb_circle.x + oneMinusAlpha * existingColor.x;
+        existingColor.y = alpha * rgb_circle.y + oneMinusAlpha * existingColor.y;
+        existingColor.z = alpha * rgb_circle.z + oneMinusAlpha * existingColor.z;
+        existingColor.w += alpha;
+    }
+
+    // Write result back to memory
+    *imgPtr = existingColor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -444,6 +477,7 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+    cudaDevicePixelList = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -465,6 +499,7 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+        cudaFree(cudaDevicePixelList);
     }
 }
 
@@ -525,6 +560,7 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+    cudaMalloc(&cudaDevicePixelList, sizeof(float) * 4 * image->width * image->height * numCircles);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -549,6 +585,7 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+    params.pixelList = cudaDevicePixelList; 
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -633,6 +670,22 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 void
 CudaRenderer::render() {
 
@@ -640,6 +693,12 @@ CudaRenderer::render() {
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
+    // Calculate intermediate results on each pixel per-circle
     kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
+
+    // Now accumulate results per-pixel for final result
+    dim3 gridDim2((image->height * image->width + blockDim.x - 1) / blockDim.x);
+    kernelRenderPixels<<<gridDim2, blockDim>>>();
+    cudaCheckError(cudaDeviceSynchronize());
 }
