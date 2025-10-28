@@ -388,9 +388,11 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int 
     *circleColorPtr = result_rgb;
 
     // Store whether the circle exists on this pixel in pixelList
-    int pixelListIndex = (pixelY * cuConstRendererParams.imageWidth + pixelX) * cuConstRendererParams.numCircles + circleIndex;
-
-    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[pixelListIndex]);
+    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
+    for (int i=0; i<cuConstRendererParams.numCircles; i++) {
+        pixelListPtr += pixelY * cuConstRendererParams.imageWidth + pixelX;
+    }
+    pixelListPtr += circleIndex;
     *pixelListPtr = 1;
 }
 
@@ -462,12 +464,16 @@ __global__ void kernelRenderPixels() {
 
     float4 rgb_circle;
     float oneMinusAlpha, alpha;
+
     // Find starting point within large pixelList array
-    int pixelListIndex = index * cuConstRendererParams.numCircles;
+    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
+    for (int i=0; i<cuConstRendererParams.numCircles; i++) {
+        pixelListPtr += index;
+    }
 
     // Iterate over each circle result to determine final pixel
     for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
-        if (cuConstRendererParams.pixelList[pixelListIndex + circleIndex] == 1){ //this would indicate that the circle is present at this pixel
+        if (*pixelListPtr == 1){ //this would indicate that the circle is present at this pixel
             rgb_circle = *(float4*)(&cuConstRendererParams.circleColor[circleIndex*4]);
             alpha = rgb_circle.w;
             oneMinusAlpha = 1.f - alpha;
@@ -477,6 +483,7 @@ __global__ void kernelRenderPixels() {
             existingColor.z = alpha * rgb_circle.z + oneMinusAlpha * existingColor.z;
             existingColor.w += alpha;
         }
+	pixelListPtr++;
     }
 
     // Write result back to memory
@@ -703,6 +710,9 @@ CudaRenderer::render() {
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    // Initialize pixelList to all zeros
+    cudaCheckError(cudaMemset(cudaDevicePixelList, 0, sizeof(uint8_t) * numCircles * image->width * image->height));
 
     // Calculate intermediate results on each pixel per-circle
     kernelRenderCircles<<<gridDim, blockDim>>>();
