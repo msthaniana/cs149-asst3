@@ -9,6 +9,7 @@
 #include <driver_functions.h>
 
 #include "cudaRenderer.h"
+#include "CycleTimer.h"
 #include "image.h"
 #include "noise.h"
 #include "sceneLoader.h"
@@ -396,12 +397,11 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int 
     *circleAlphaPtr = alpha;
 
     // Store whether the circle exists on this pixel in pixelList
-    //TODO: move this logic out of here. Can be done before the call
-    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
-    int bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;
-    for (int i=0; i<bytes; i++) {
-        pixelListPtr += pixelY * cuConstRendererParams.imageWidth + pixelX;
-    }
+    //TODO: move this logic out of here. Can be done before the call so not per thread
+    long long bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;
+    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[bytes*(pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+
+     //TODO: can we do this in a better way?
     int circleByteIndex = circleIndex/8;
     int circleBitIndex = circleIndex%8;
     pixelListPtr += circleByteIndex;
@@ -479,11 +479,9 @@ __global__ void kernelRenderPixels() {
     float oneMinusAlpha, alpha;
 
     // Find starting point within large pixelList array
-    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
-    int bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;
-    for (int i=0; i<bytes; i++) {
-        pixelListPtr += index;
-    }
+    long long bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;//TODO: this math seems like a repeat for each
+    
+    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[bytes*index]);
 
     // Iterate over each circle result to determine final pixel
     for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
@@ -732,13 +730,23 @@ CudaRenderer::render() {
     int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
     cudaCheckError(cudaMemset(cudaDevicePixelList, 0, sizeof(uint8_t) * num_bytes * image->width * image->height));
 
-
+    double startRenderCirclesTime = CycleTimer::currentSeconds();
     // Calculate intermediate results on each pixel per-circle
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaCheckError(cudaDeviceSynchronize());
+    double endRenderCirclesTime = CycleTimer::currentSeconds();
 
+    double startRenderPixelsTime = CycleTimer::currentSeconds();
     // Now accumulate results per-pixel for final result
     dim3 gridDim2((image->height * image->width + blockDim.x - 1) / blockDim.x);
     kernelRenderPixels<<<gridDim2, blockDim>>>();
     cudaCheckError(cudaDeviceSynchronize());
+    double endRenderPixelsTime = CycleTimer::currentSeconds();
+
+    double totalRenderCirclesTime = endRenderCirclesTime - startRenderCirclesTime;
+    double totalRenderPixelsTime = endRenderPixelsTime - startRenderPixelsTime;
+
+    printf("Render Circles:    %.4f ms\n", 1000.f * totalRenderCirclesTime);
+    printf("Render Pixels:    %.4f ms\n", 1000.f * totalRenderPixelsTime);
+
 }
