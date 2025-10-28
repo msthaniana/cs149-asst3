@@ -395,25 +395,17 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int 
     float* circleAlphaPtr = (float*)(&cuConstRendererParams.circleAlpha[circleIndex]);
     *circleAlphaPtr = alpha;
 
-    // // Store whether the circle exists on this pixel in pixelList - new code
-    // uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
-    // int num_bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles/8 + 1 : cuConstRendererParams.numCircles/8;
-    // for (int i=0; i<num_bytes; i++) {
-    //     pixelListPtr += pixelY * cuConstRendererParams.imageWidth + pixelX;
-    // }
-    // int circleByteIndex = circleIndex/8;
-    // int circleBitIndex = circleIndex%8;
-    // pixelListPtr += circleByteIndex;
-    // *pixelListPtr |= (0x1 << circleBitIndex);
-
-
-    // Store whether the circle exists on this pixel in pixelList - old code
+    // Store whether the circle exists on this pixel in pixelList
+    //TODO: move this logic out of here. Can be done before the call
     uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
-    for (int i=0; i<cuConstRendererParams.numCircles; i++) {
+    int bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;
+    for (int i=0; i<bytes; i++) {
         pixelListPtr += pixelY * cuConstRendererParams.imageWidth + pixelX;
     }
-    pixelListPtr += circleIndex;
-    *pixelListPtr = 1;
+    int circleByteIndex = circleIndex/8;
+    int circleBitIndex = circleIndex%8;
+    pixelListPtr += circleByteIndex;
+    *pixelListPtr = (*pixelListPtr) | (0x1 << circleBitIndex);
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -486,26 +478,18 @@ __global__ void kernelRenderPixels() {
     float3 rgb;
     float oneMinusAlpha, alpha;
 
-    // Find starting point within large pixelList array - new code
-    // uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
-    // int circleByteIndex = cuConstRendererParams.numCircles/8;
-    // for (int i=0; i<circleByteIndex; i++) {
-    //     pixelListPtr += index;
-    // }
-
-    // Find starting point within large pixelList array - old code
+    // Find starting point within large pixelList array
     uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[0]);
-    for (int i=0; i<cuConstRendererParams.numCircles; i++) {
+    int bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;
+    for (int i=0; i<bytes; i++) {
         pixelListPtr += index;
     }
 
     // Iterate over each circle result to determine final pixel
     for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
-        //new code
-        // int circleBitIndex = circleIndex%8;
-        // if (*pixelListPtr &  (1 << circleBitIndex)){ //this would indicate that the circle is present at this pixel
-        
-        if (*pixelListPtr == 1){ //old code
+        int circleBitIndex = circleIndex%8;
+        if (circleBitIndex == 0 && circleIndex!=0 ) pixelListPtr++;
+        if ((*pixelListPtr &  (uint8_t)(1 << circleBitIndex))){ //this would indicate that the circle is present at this pixel
             rgb_circle = *(float*)(&cuConstRendererParams.circleAlpha[circleIndex]);
             alpha = rgb_circle;
             rgb = *(float3*)&(cuConstRendererParams.color[circleIndex*3]);
@@ -516,7 +500,6 @@ __global__ void kernelRenderPixels() {
             existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
             existingColor.w += alpha;
         }
-	pixelListPtr++;
     }
 
     // Write result back to memory
@@ -625,12 +608,8 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
-    //new code
-    // int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
-    // cudaCheckError(cudaMalloc(&cudaDevicePixelList,sizeof(uint8_t) * image->width * image->height * num_bytes));//holds info about whether the corresponding circle exists at that pixel //TODO: need to make this further smaller
-    // //new code
-    
-    cudaCheckError(cudaMalloc(&cudaDevicePixelList,sizeof(uint8_t) * image->width * image->height * numCircles));//holds info about whether the corresponding circle exists at that pixel //TODO: need to make this further smaller
+    int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
+    cudaCheckError(cudaMalloc(&cudaDevicePixelList,sizeof(uint8_t) * image->width * image->height * num_bytes));//holds info about whether the corresponding circle exists at that pixel //TODO: need to make this further smaller
     cudaCheckError(cudaMalloc(&cudaDevicecircleAlpha, sizeof(float) * numCircles));//holds the alpha info for each circle
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -749,11 +728,9 @@ CudaRenderer::render() {
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    // // Initialize pixelList to all zeros - new
-    // int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
-    // cudaCheckError(cudaMemset(cudaDevicePixelList, 0, sizeof(uint8_t) * num_bytes * image->width * image->height));
-
-    cudaCheckError(cudaMemset(cudaDevicePixelList, 0, sizeof(uint8_t) * numCircles * image->width * image->height));
+    // Initialize pixelList to all zeros
+    int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
+    cudaCheckError(cudaMemset(cudaDevicePixelList, 0, sizeof(uint8_t) * num_bytes * image->width * image->height));
 
 
     // Calculate intermediate results on each pixel per-circle
