@@ -8,29 +8,12 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
-#include "cudaRenderer.h"
 #include "CycleTimer.h"
+#include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
-
-#define DEBUG
-#ifdef DEBUG
-#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
-inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
-        cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-#else
-#define cudaCheckError(ans) ans
-#endif
-
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -45,13 +28,13 @@ struct GlobalConstants {
     float* velocity;
     float* color;
     float* radius;
+    int boxWidth;
+    int boxHeight;
 
     int imageWidth;
     int imageHeight;
     float* imageData;
-
-    uint8_t* pixelList;
-    float* circleAlpha;
+    uint8_t* boxList;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -76,6 +59,24 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
+
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -339,27 +340,23 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int pixelX, int pixelY) {
+shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    //float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
         return;
 
-    float3 rgb;
+    //float3 rgb;
     float alpha;
 
     // there is a non-zero contribution.  Now compute the shading value
-
-    //TODO: need to think about how since pixelCenter is assigned in the inner loop
-    //DO we even need to store the alpha and the color info for the snow cases?
-    //this likely is more a perf improvement
 
     // suggestion: This conditional is in the inner loop.  Although it
     // will evaluate the same for all threads, there is overhead in
@@ -375,37 +372,33 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int 
         float normPixelDist = sqrt(pixelDist) / rad;
         rgb = lookupColor(normPixelDist);
 
-        //TODO: confirm if this is correct. I am assuming that the color array can be used for these cases
-        float3* colorPtr = (float3*)(&cuConstRendererParams.color[3 * circleIndex]);
-        *colorPtr = rgb;
-        //end confirm approach - another way would be to store the normPixelDist info only and then do color and alpha math later
-
         float maxAlpha = .6f + .4f * (1.f-p.z);
         maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
     } else {
         // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        //int index3 = 3 * circleIndex;
+        //rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
     }
 
-    // store color data into circleAlpha array for each circle
-    // float4 result_rgb = make_float4(rgb.x, rgb.y, rgb.z, alpha);
-    float* circleAlphaPtr = (float*)(&cuConstRendererParams.circleAlpha[circleIndex]);
-    *circleAlphaPtr = alpha;
+    float oneMinusAlpha = 1.f - alpha;
 
-    // Store whether the circle exists on this pixel in pixelList
-    //TODO: move this logic out of here. Can be done before the call so not per thread
-    long long bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;
-    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[bytes*(pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
 
-     //TODO: can we do this in a better way?
-    int circleByteIndex = circleIndex/8;
-    int circleBitIndex = circleIndex%8;
-    pixelListPtr += circleByteIndex;
-    *pixelListPtr = (*pixelListPtr) | (0x1 << circleBitIndex);
+    float4 existingColor = *imagePtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+
+    // global memory write
+    *imagePtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -413,13 +406,12 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, int 
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
+/*__global__ void kernelRenderCircles() {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (index >= cuConstRendererParams.numCircles)
         return;
-    //printf("Running renderCircles for circle=%d, numCircles=%d\n", index, cuConstRendererParams.numCircles);
 
     int index3 = 3 * index;
 
@@ -451,57 +443,122 @@ __global__ void kernelRenderCircles() {
         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr, pixelX, pixelY);
+            shadePixel(index, pixelCenterNorm, p, imgPtr);
             imgPtr++;
         }
     }
-}
+}*/
 
 // kernelRenderPixels -- (CUDA device code)
 //
-// Each thread renders a pixel by iterating through the list of circle
-// results and accumulating its effect on this pixel in the correct
-// order of operations.
+// Each thread renders a pixel by iterating over all circles and
+// accumulating the effect of the circle on the pixel
 __global__ void kernelRenderPixels() {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index >= cuConstRendererParams.imageHeight * cuConstRendererParams.imageWidth)
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
         return;
 
-    // Determine imagePtr to update
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * index]);
+    int threadIndex = threadIdx.y * blockDim.x + threadIdx.x;
+    int blockSize = blockDim.x * blockDim.y;
 
-    // Read initial pixel value
-    float4 existingColor = *imgPtr;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    float rgb_circle;
-    float3 rgb;
-    float oneMinusAlpha, alpha;
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 updColor = *imgPtr;
 
-    // Find starting point within large pixelList array
-    long long bytes = cuConstRendererParams.numCircles % 8 ? cuConstRendererParams.numCircles / 8 + 1 : cuConstRendererParams.numCircles / 8;//TODO: this math seems like a repeat for each
-    
-    uint8_t* pixelListPtr = (uint8_t*)(&cuConstRendererParams.pixelList[bytes*index]);
+    int boxX = pixelX / cuConstRendererParams.boxWidth; 
+    int boxY = pixelY / cuConstRendererParams.boxHeight;
+    int boxIndex = boxX * cuConstRendererParams.imageHeight / cuConstRendererParams.boxHeight + boxY;
+    uint8_t* boxListPtr = (uint8_t*)(&cuConstRendererParams.boxList[0]);
+    for (int i=0; i<boxIndex; i++) boxListPtr += cuConstRendererParams.numCircles; // Hack for pointer arithmetic
+    //for (int i=0; i<cuConstRendererParams.numCircles; i++) boxListPtr += boxIndex; // Hack for pointer arithmetic
+    boxListPtr += threadIndex;
 
-    // Iterate over each circle result to determine final pixel
-    for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
-        int circleBitIndex = circleIndex%8;
-        if (circleBitIndex == 0 && circleIndex!=0 ) pixelListPtr++;
-        if ((*pixelListPtr &  (uint8_t)(1 << circleBitIndex))){ //this would indicate that the circle is present at this pixel
-            rgb_circle = *(float*)(&cuConstRendererParams.circleAlpha[circleIndex]);
-            alpha = rgb_circle;
-            rgb = *(float3*)&(cuConstRendererParams.color[circleIndex*3]);
-            oneMinusAlpha = 1.f - alpha;
+    // Load circle information into shared memory in chunks of blockSize
+    extern __shared__ uint8_t s[];
+    uint8_t *sharedBoxList = s;
+    float   *sharedCircleRadius   = (float*)&sharedBoxList[blockSize];
+    float3  *sharedCirclePosition = (float3*)&sharedCircleRadius[blockSize];
+    float3  *sharedCircleColor    = (float3*)&sharedCirclePosition[blockSize];
 
-            existingColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-            existingColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-            existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-            existingColor.w += alpha;
+    int startingIndex = threadIndex;
+    for (int chunkIndex = 0; chunkIndex < (cuConstRendererParams.numCircles + blockSize - 1)/blockSize; chunkIndex++) {
+        __syncthreads();
+        // Preload next blockSize circles into shared memory
+        if (startingIndex < cuConstRendererParams.numCircles) {
+            sharedBoxList[threadIndex]        = *boxListPtr;
+            if (sharedBoxList[threadIndex] == 1) {
+                sharedCirclePosition[threadIndex] = *(float3*)(&cuConstRendererParams.position[3*startingIndex]);
+                sharedCircleRadius[threadIndex]   = cuConstRendererParams.radius[startingIndex];
+                sharedCircleColor[threadIndex]    = *(float3*)&(cuConstRendererParams.color[3*startingIndex]);
+            }
+        } else {
+            sharedBoxList[threadIndex] = 0;
         }
-    }
+        __syncthreads();
 
-    // Write result back to memory
-    *imgPtr = existingColor;
+        // Loop over blockSize circles to determine effect on pixel
+        for (int circleIndex = 0; circleIndex < blockSize; circleIndex++) {
+            if (sharedBoxList[circleIndex] == 1) {
+                float3 circle_p   = sharedCirclePosition[circleIndex];
+                float  circle_rad = sharedCircleRadius[circleIndex];
+                float3 circle_rgb = sharedCircleColor[circleIndex];
+                shadePixel(circleIndex + chunkIndex*blockSize, 
+                           circle_rad, circle_rgb, pixelCenterNorm, circle_p, &updColor);
+            }
+        }
+        startingIndex += blockSize;
+        boxListPtr += blockSize;
+    }
+    // global memory write
+    *imgPtr = updColor;
+}
+
+
+// kernelScanCircles -- (CUDA device code)
+//
+// Each thread scans all boxes for a circle, and updates boxList if present
+__global__ void kernelScanCircles() {
+
+    int circleIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circleIndex >= cuConstRendererParams.numCircles)
+        return;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[circleIndex * 3]);
+    float  rad = cuConstRendererParams.radius[circleIndex];
+
+    // Starting pointer into boxList
+    uint8_t* boxListPtr = (uint8_t*)(&cuConstRendererParams.boxList[circleIndex]);
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    float boxL = 0.f;
+    float boxB = 0.f;
+    float boxL_incr = invWidth * (static_cast<float>(cuConstRendererParams.boxWidth));
+    float boxB_incr = invHeight * (static_cast<float>(cuConstRendererParams.boxHeight));
+
+    // Iterate over all boxes in image
+    // Note: boxR >= boxL and boxT >= boxB
+    for (int box_x = 0; box_x < cuConstRendererParams.imageWidth / cuConstRendererParams.boxWidth; box_x++) {
+        boxB = 0.f;
+        for (int box_y = 0; box_y < cuConstRendererParams.imageHeight / cuConstRendererParams.boxHeight; box_y++) {
+            *boxListPtr = circleInBoxConservative(p.x, p.y, rad, boxL, boxL+boxL_incr, boxB+boxB_incr, boxB);
+	    boxListPtr += cuConstRendererParams.numCircles;
+            boxB += boxB_incr;
+        }
+        boxL += boxL_incr;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -515,14 +572,15 @@ CudaRenderer::CudaRenderer() {
     velocity = NULL;
     color = NULL;
     radius = NULL;
+    boxWidth = 16;
+    boxHeight = 16;
 
     cudaDevicePosition = NULL;
     cudaDeviceVelocity = NULL;
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
-    cudaDevicePixelList = NULL;
-    cudaDevicecircleAlpha = NULL;
+    cudaDeviceBoxList = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -544,8 +602,7 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
-        cudaCheckError(cudaFree(cudaDevicePixelList));
-        cudaCheckError(cudaFree(cudaDevicecircleAlpha));
+        cudaCheckError(cudaFree(cudaDeviceBoxList));
     }
 }
 
@@ -606,9 +663,7 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
-    int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
-    cudaCheckError(cudaMalloc(&cudaDevicePixelList,sizeof(uint8_t) * image->width * image->height * num_bytes));//holds info about whether the corresponding circle exists at that pixel //TODO: need to make this further smaller
-    cudaCheckError(cudaMalloc(&cudaDevicecircleAlpha, sizeof(float) * numCircles));//holds the alpha info for each circle
+    cudaCheckError(cudaMalloc(&cudaDeviceBoxList, sizeof(uint8_t) * numCircles * image->width * image->height / boxWidth / boxHeight));
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -633,8 +688,9 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
-    params.pixelList = cudaDevicePixelList;
-    params.circleAlpha = cudaDevicecircleAlpha;
+    params.boxList = cudaDeviceBoxList;
+    params.boxWidth = boxWidth;
+    params.boxHeight = boxHeight;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -722,31 +778,30 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // Clear boxList
+    cudaCheckError(cudaMemset(cudaDeviceBoxList, 0, sizeof(uint8_t) * numCircles * image->width * image->height / boxWidth / boxHeight));
 
-    // Initialize pixelList to all zeros
-    int num_bytes = numCircles % 8 ? numCircles/8 + 1 : numCircles/8;
-    cudaCheckError(cudaMemset(cudaDevicePixelList, 0, sizeof(uint8_t) * num_bytes * image->width * image->height));
+    //double startTime = CycleTimer::currentSeconds();
 
-    double startRenderCirclesTime = CycleTimer::currentSeconds();
-    // Calculate intermediate results on each pixel per-circle
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    // Scan circles and update boxList
+    dim3 blockDim1(256, 1);
+    dim3 gridDim1((numCircles + blockDim1.x - 1) / blockDim1.x);
+    kernelScanCircles<<<gridDim1, blockDim1>>>();
     cudaCheckError(cudaDeviceSynchronize());
-    double endRenderCirclesTime = CycleTimer::currentSeconds();
 
-    double startRenderPixelsTime = CycleTimer::currentSeconds();
-    // Now accumulate results per-pixel for final result
-    dim3 gridDim2((image->height * image->width + blockDim.x - 1) / blockDim.x);
-    kernelRenderPixels<<<gridDim2, blockDim>>>();
+    //double endTime = CycleTimer::currentSeconds();
+    //double totalTime = endTime - startTime;
+    //printf("Scan Circles time: %.4f ms\n", 1000.f * totalTime);
+    //startTime = CycleTimer::currentSeconds();
+
+    // Update each pixel based on scan results
+    dim3 blockDim2(16, 16);
+    dim3 gridDim2((image->width + blockDim2.x - 1) / blockDim2.x, (image->height + blockDim2.y - 1) / blockDim2.y);
+    size_t sharedMemSize = (sizeof(float) + sizeof(float3) + sizeof(float3) + sizeof(uint8_t)) * blockDim2.x * blockDim2.y;
+    kernelRenderPixels<<<gridDim2, blockDim2, sharedMemSize>>>();
     cudaCheckError(cudaDeviceSynchronize());
-    double endRenderPixelsTime = CycleTimer::currentSeconds();
 
-    double totalRenderCirclesTime = endRenderCirclesTime - startRenderCirclesTime;
-    double totalRenderPixelsTime = endRenderPixelsTime - startRenderPixelsTime;
-
-    printf("Render Circles:    %.4f ms\n", 1000.f * totalRenderCirclesTime);
-    printf("Render Pixels:    %.4f ms\n", 1000.f * totalRenderPixelsTime);
-
+    //endTime = CycleTimer::currentSeconds();
+    //totalTime = endTime - startTime;
+    //printf("Render Pixels time: %.4f ms\n", 1000.f * totalTime);
 }
