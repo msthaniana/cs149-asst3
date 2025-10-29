@@ -15,7 +15,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define SCAN_BLOCK_DIM 256
+#define SCAN_BLOCK_DIM 1024
 #include "exclusiveScan.cu_inl"
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -356,7 +356,7 @@ shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p,
         return;
 
     //float3 rgb;
-    float alpha;
+    float alpha = .5f;
 
     // there is a non-zero contribution.  Now compute the shading value
 
@@ -378,10 +378,7 @@ shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p,
         maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
-    } else {
-        // simple: each circle has an assigned color
-        alpha = .5f;
-    }
+    } 
 
     float oneMinusAlpha = 1.f - alpha;
 
@@ -428,10 +425,8 @@ __global__ void kernelRenderPixels() {
 
     int boxX = pixelX / cuConstRendererParams.boxWidth; 
     int boxY = pixelY / cuConstRendererParams.boxHeight;
-    int boxIndex = boxX * cuConstRendererParams.imageHeight / cuConstRendererParams.boxHeight + boxY;
-    uint8_t* boxListPtr = (uint8_t*)(&cuConstRendererParams.boxList[0]);
-    for (int i=0; i<boxIndex; i++) boxListPtr += cuConstRendererParams.numCircles; // Hack for pointer arithmetic
-    //for (int i=0; i<cuConstRendererParams.numCircles; i++) boxListPtr += boxIndex; // Hack for pointer arithmetic
+    long long boxIndex = boxX * cuConstRendererParams.imageHeight / cuConstRendererParams.boxHeight + boxY;
+    uint8_t* boxListPtr = (uint8_t*)(&cuConstRendererParams.boxList[boxIndex*cuConstRendererParams.numCircles]);
     boxListPtr += threadIndex;
 
     // Load circle information into shared memory in chunks of blockSize
@@ -532,8 +527,8 @@ CudaRenderer::CudaRenderer() {
     velocity = NULL;
     color = NULL;
     radius = NULL;
-    boxWidth = 16;
-    boxHeight = 16;
+    boxWidth = 32;
+    boxHeight = 32;
 
     cudaDevicePosition = NULL;
     cudaDeviceVelocity = NULL;
@@ -741,7 +736,7 @@ CudaRenderer::render() {
     // Clear boxList
     cudaCheckError(cudaMemset(cudaDeviceBoxList, 0, sizeof(uint8_t) * numCircles * image->width * image->height / boxWidth / boxHeight));
 
-    //double startTime = CycleTimer::currentSeconds();
+    // double startTime = CycleTimer::currentSeconds();
 
     // Scan circles and update boxList
     dim3 blockDim1(256, 1);
@@ -749,10 +744,10 @@ CudaRenderer::render() {
     kernelScanCircles<<<gridDim1, blockDim1>>>();
     cudaCheckError(cudaDeviceSynchronize());
 
-    //double endTime = CycleTimer::currentSeconds();
-    //double totalTime = endTime - startTime;
-    //printf("Scan Circles time: %.4f ms\n", 1000.f * totalTime);
-    //startTime = CycleTimer::currentSeconds();
+    // double endTime = CycleTimer::currentSeconds();
+    // double totalTime = endTime - startTime;
+    // printf("Scan Circles time: %.4f ms\n", 1000.f * totalTime);
+    // startTime = CycleTimer::currentSeconds();
 
     // Update each pixel based on scan results
     dim3 blockDim2(boxWidth, boxHeight);
@@ -760,7 +755,7 @@ CudaRenderer::render() {
     kernelRenderPixels<<<gridDim2, blockDim2>>>();
     cudaCheckError(cudaDeviceSynchronize());
 
-    //endTime = CycleTimer::currentSeconds();
-    //totalTime = endTime - startTime;
-    //printf("Render Pixels time: %.4f ms\n", 1000.f * totalTime);
+    // endTime = CycleTimer::currentSeconds();
+    // totalTime = endTime - startTime;
+    // printf("Render Pixels time: %.4f ms\n", 1000.f * totalTime);
 }
