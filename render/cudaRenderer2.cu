@@ -340,20 +340,20 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    //float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
         return;
 
-    float3 rgb;
+    //float3 rgb;
     float alpha;
 
     // there is a non-zero contribution.  Now compute the shading value
@@ -378,8 +378,8 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     } else {
         // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        //int index3 = 3 * circleIndex;
+        //rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
     }
 
@@ -406,7 +406,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
+/*__global__ void kernelRenderCircles() {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -447,7 +447,7 @@ __global__ void kernelRenderCircles() {
             imgPtr++;
         }
     }
-}
+}*/
 
 // kernelRenderPixels -- (CUDA device code)
 //
@@ -460,6 +460,9 @@ __global__ void kernelRenderPixels() {
     if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
         return;
 
+    int threadIndex = threadIdx.y * blockDim.x + threadIdx.x;
+    int blockSize = blockDim.x * blockDim.y;
+
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     float invWidth = 1.f / imageWidth;
@@ -468,26 +471,60 @@ __global__ void kernelRenderPixels() {
                                          invHeight * (static_cast<float>(pixelY) + 0.5f));
 
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 updColor = *imgPtr;
+
     int boxX = pixelX / cuConstRendererParams.boxWidth; 
     int boxY = pixelY / cuConstRendererParams.boxHeight;
     int boxIndex = boxX * cuConstRendererParams.imageHeight / cuConstRendererParams.boxHeight + boxY;
     uint8_t* boxListPtr = (uint8_t*)(&cuConstRendererParams.boxList[0]);
     for (int i=0; i<boxIndex; i++) boxListPtr += cuConstRendererParams.numCircles; // Hack for pointer arithmetic
     //for (int i=0; i<cuConstRendererParams.numCircles; i++) boxListPtr += boxIndex; // Hack for pointer arithmetic
+    boxListPtr += threadIndex;
 
-    for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
-        if (*boxListPtr == 1) {
-            float3 circle_p = *(float3*)(&cuConstRendererParams.position[circleIndex*3]);
-            shadePixel(circleIndex, pixelCenterNorm, circle_p, imgPtr);
+    // Load circle information into shared memory in chunks of blockSize
+    extern __shared__ uint8_t s[];
+    uint8_t *sharedBoxList = s;
+    float   *sharedCircleRadius   = (float*)&sharedBoxList[blockSize];
+    float3  *sharedCirclePosition = (float3*)&sharedCircleRadius[blockSize];
+    float3  *sharedCircleColor    = (float3*)&sharedCirclePosition[blockSize];
+
+    int startingIndex = threadIndex;
+    for (int chunkIndex = 0; chunkIndex < (cuConstRendererParams.numCircles + blockSize - 1)/blockSize; chunkIndex++) {
+        __syncthreads();
+        // Preload next blockSize circles into shared memory
+        if (startingIndex < cuConstRendererParams.numCircles) {
+            sharedBoxList[threadIndex]        = *boxListPtr;
+            if (sharedBoxList[threadIndex] == 1) {
+                sharedCirclePosition[threadIndex] = *(float3*)(&cuConstRendererParams.position[3*startingIndex]);
+                sharedCircleRadius[threadIndex]   = cuConstRendererParams.radius[startingIndex];
+                sharedCircleColor[threadIndex]    = *(float3*)&(cuConstRendererParams.color[3*startingIndex]);
+            }
+        } else {
+            sharedBoxList[threadIndex] = 0;
         }
-	boxListPtr++;
+        __syncthreads();
+
+        // Loop over blockSize circles to determine effect on pixel
+        for (int circleIndex = 0; circleIndex < blockSize; circleIndex++) {
+            if (sharedBoxList[circleIndex] == 1) {
+                float3 circle_p   = sharedCirclePosition[circleIndex];
+                float  circle_rad = sharedCircleRadius[circleIndex];
+                float3 circle_rgb = sharedCircleColor[circleIndex];
+                shadePixel(circleIndex + chunkIndex*blockSize, 
+                           circle_rad, circle_rgb, pixelCenterNorm, circle_p, &updColor);
+            }
+        }
+        startingIndex += blockSize;
+        boxListPtr += blockSize;
     }
+    // global memory write
+    *imgPtr = updColor;
 }
 
 
 // kernelScanCircles -- (CUDA device code)
 //
-// Each thread (1 thread per circle) scans all boxes and updates boxList if present
+// Each thread scans all boxes for a circle, and updates boxList if present
 __global__ void kernelScanCircles() {
 
     int circleIndex = blockIdx.x * blockDim.x + threadIdx.x;
@@ -760,7 +797,8 @@ CudaRenderer::render() {
     // Update each pixel based on scan results
     dim3 blockDim2(16, 16);
     dim3 gridDim2((image->width + blockDim2.x - 1) / blockDim2.x, (image->height + blockDim2.y - 1) / blockDim2.y);
-    kernelRenderPixels<<<gridDim2, blockDim2>>>();
+    size_t sharedMemSize = (sizeof(float) + sizeof(float3) + sizeof(float3) + sizeof(uint8_t)) * blockDim2.x * blockDim2.y;
+    kernelRenderPixels<<<gridDim2, blockDim2, sharedMemSize>>>();
     cudaCheckError(cudaDeviceSynchronize());
 
     //endTime = CycleTimer::currentSeconds();
