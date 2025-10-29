@@ -15,6 +15,9 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define SCAN_BLOCK_DIM 256
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -346,7 +349,6 @@ shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p,
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    //float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -378,8 +380,6 @@ shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p,
 
     } else {
         // simple: each circle has an assigned color
-        //int index3 = 3 * circleIndex;
-        //rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
     }
 
@@ -401,53 +401,6 @@ shadePixel(int circleIndex, float rad, float3 rgb, float2 pixelCenter, float3 p,
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-/*__global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
-        }
-    }
-}*/
 
 // kernelRenderPixels -- (CUDA device code)
 //
@@ -482,37 +435,44 @@ __global__ void kernelRenderPixels() {
     boxListPtr += threadIndex;
 
     // Load circle information into shared memory in chunks of blockSize
-    extern __shared__ uint8_t s[];
-    uint8_t *sharedBoxList = s;
-    float   *sharedCircleRadius   = (float*)&sharedBoxList[blockSize];
-    float3  *sharedCirclePosition = (float3*)&sharedCircleRadius[blockSize];
-    float3  *sharedCircleColor    = (float3*)&sharedCirclePosition[blockSize];
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2*SCAN_BLOCK_DIM];
+    __shared__ uint sharedCircleIndices[SCAN_BLOCK_DIM];
 
+    int numActiveCircles = 0;
     int startingIndex = threadIndex;
     for (int chunkIndex = 0; chunkIndex < (cuConstRendererParams.numCircles + blockSize - 1)/blockSize; chunkIndex++) {
         __syncthreads();
-        // Preload next blockSize circles into shared memory
+        // Preload next blockSize values of boxList into shared memory
         if (startingIndex < cuConstRendererParams.numCircles) {
-            sharedBoxList[threadIndex]        = *boxListPtr;
-            if (sharedBoxList[threadIndex] == 1) {
-                sharedCirclePosition[threadIndex] = *(float3*)(&cuConstRendererParams.position[3*startingIndex]);
-                sharedCircleRadius[threadIndex]   = cuConstRendererParams.radius[startingIndex];
-                sharedCircleColor[threadIndex]    = *(float3*)&(cuConstRendererParams.color[3*startingIndex]);
-            }
+            prefixSumInput[threadIndex] = *boxListPtr;
         } else {
-            sharedBoxList[threadIndex] = 0;
+            prefixSumInput[threadIndex] = 0;
         }
         __syncthreads();
 
-        // Loop over blockSize circles to determine effect on pixel
-        for (int circleIndex = 0; circleIndex < blockSize; circleIndex++) {
-            if (sharedBoxList[circleIndex] == 1) {
-                float3 circle_p   = sharedCirclePosition[circleIndex];
-                float  circle_rad = sharedCircleRadius[circleIndex];
-                float3 circle_rgb = sharedCircleColor[circleIndex];
-                shadePixel(circleIndex + chunkIndex*blockSize, 
-                           circle_rad, circle_rgb, pixelCenterNorm, circle_p, &updColor);
-            }
+        // Run exclusive scan on current chunk
+        //  - This gives us an output array where for every input[i] == 1, output[i] = index to write into
+        sharedMemExclusiveScan(threadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+
+        // Populate sharedCircleIndices using scan results
+        if (prefixSumInput[threadIndex] == 1) {
+            sharedCircleIndices[prefixSumOutput[threadIndex]] = threadIndex + chunkIndex * blockSize;
+        }
+        __syncthreads();
+
+        // Calculate the number of circles within this range of entries that actually intersect this box
+        numActiveCircles = prefixSumOutput[SCAN_BLOCK_DIM-1] + prefixSumInput[SCAN_BLOCK_DIM-1];
+
+        // Loop over blockSize circles to accumulate effect on pixel
+        for (int circleListIndex = 0; circleListIndex < numActiveCircles; circleListIndex++) {
+            int circleIndex = sharedCircleIndices[circleListIndex];
+            float3 circle_p   = *(float3*)(&cuConstRendererParams.position[3*circleIndex]);
+            float3 circle_rgb = *(float3*)(&cuConstRendererParams.color[3*circleIndex]);
+            float  circle_rad = cuConstRendererParams.radius[circleIndex];
+            shadePixel(circleIndex, circle_rad, circle_rgb, pixelCenterNorm, circle_p, &updColor);
         }
         startingIndex += blockSize;
         boxListPtr += blockSize;
@@ -795,10 +755,9 @@ CudaRenderer::render() {
     //startTime = CycleTimer::currentSeconds();
 
     // Update each pixel based on scan results
-    dim3 blockDim2(16, 16);
+    dim3 blockDim2(boxWidth, boxHeight);
     dim3 gridDim2((image->width + blockDim2.x - 1) / blockDim2.x, (image->height + blockDim2.y - 1) / blockDim2.y);
-    size_t sharedMemSize = (sizeof(float) + sizeof(float3) + sizeof(float3) + sizeof(uint8_t)) * blockDim2.x * blockDim2.y;
-    kernelRenderPixels<<<gridDim2, blockDim2, sharedMemSize>>>();
+    kernelRenderPixels<<<gridDim2, blockDim2>>>();
     cudaCheckError(cudaDeviceSynchronize());
 
     //endTime = CycleTimer::currentSeconds();
