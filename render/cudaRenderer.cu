@@ -446,7 +446,7 @@ __global__ void kernelRenderPixels() {
         if (startingIndex < cuConstRendererParams.numCircles) {
             p1 = *(float3*)(&cuConstRendererParams.position[startingIndex * 3]);
             rad1 = cuConstRendererParams.radius[startingIndex];
-            prefixSumInput[threadIndex] = circleInBoxConservative(p1.x, p1.y, rad1, boxL, boxL+boxL_incr, boxB+boxB_incr, boxB);
+            prefixSumInput[threadIndex] = circleInBox(p1.x, p1.y, rad1, boxL, boxL+boxL_incr, boxB+boxB_incr, boxB);
         } else {
             prefixSumInput[threadIndex] = 0;
         }
